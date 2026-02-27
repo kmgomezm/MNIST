@@ -580,6 +580,68 @@ with tabs[2]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 4 – Draw & Predict
 # ════════════════════════════════════════════════════════════════════════════
+
+def preprocess_canvas_to_mnist(image_data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert a canvas RGBA image (H×W×4) into an 8×8 float array matching
+    the sklearn digits dataset distribution (values 0–16).
+
+    Pipeline:
+      1. RGBA → Grayscale
+      2. Crop to bounding box of the drawn stroke (removes empty margins)
+      3. Add padding (20%) so the digit doesn't touch the edges — matches MNIST style
+      4. Resize to 8×8 with high-quality downsampling
+      5. Invert if needed so digit is bright on dark background
+      6. Rescale linearly to [0, 16] range
+    Returns (img_flat_1d, img_8x8) tuple.
+    """
+    from PIL import ImageOps, ImageFilter
+
+    img_pil = Image.fromarray(image_data.astype("uint8"), mode="RGBA").convert("L")
+    img_np = np.array(img_pil)
+
+    # ── 1. Check canvas has actual content ──────────────────────────────────
+    if img_np.max() == 0:
+        return None, None
+
+    # ── 2. Crop bounding box around the drawn stroke ─────────────────────────
+    # Find rows/cols that have any non-zero pixel
+    rows = np.any(img_np > 10, axis=1)
+    cols = np.any(img_np > 10, axis=0)
+    if not rows.any() or not cols.any():
+        return None, None
+
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    cropped = img_np[rmin:rmax+1, cmin:cmax+1]
+
+    # ── 3. Pad to square with 20% margin (mirrors MNIST centering) ───────────
+    h, w = cropped.shape
+    side = max(h, w)
+    pad = max(int(side * 0.25), 2)
+    square = np.zeros((side + 2 * pad, side + 2 * pad), dtype=np.uint8)
+    y_off = pad + (side - h) // 2
+    x_off = pad + (side - w) // 2
+    square[y_off:y_off+h, x_off:x_off+w] = cropped
+
+    # ── 4. Smooth slightly before aggressive downscale ───────────────────────
+    img_sq = Image.fromarray(square)
+    img_sq = img_sq.filter(ImageFilter.GaussianBlur(radius=1))
+
+    # ── 5. Resize to 8×8 ─────────────────────────────────────────────────────
+    img_8 = img_sq.resize((8, 8), Image.LANCZOS)
+    img_8_np = np.array(img_8, dtype=float)
+
+    # ── 6. Rescale to [0, 16] matching sklearn digits range ─────────────────
+    mn, mx = img_8_np.min(), img_8_np.max()
+    if mx > mn:
+        img_8_np = (img_8_np - mn) / (mx - mn) * 16.0
+    else:
+        img_8_np = np.zeros_like(img_8_np)
+
+    return img_8_np.flatten().reshape(1, -1), img_8_np
+
+
 with tabs[3]:
     st.markdown('<p class="section-header">Draw a Digit & Predict</p>', unsafe_allow_html=True)
 
@@ -589,13 +651,21 @@ with tabs[3]:
         try:
             from streamlit_drawable_canvas import st_canvas
 
-            col_draw, col_result = st.columns([1.2, 1])
+            st.markdown("""
+            <div style='background:#1e1e24;border:1px solid #2a2a35;border-radius:10px;
+            padding:10px 16px;font-size:0.82rem;color:#888899;margin-bottom:16px;'>
+            💡 <b style='color:#f7a26a;'>Tips para mejor precisión:</b>
+            Dibuja el dígito <b>grande y centrado</b>, con trazos gruesos.
+            El sistema recortará automáticamente los márgenes y ajustará el tamaño a 8×8 px.
+            </div>""", unsafe_allow_html=True)
+
+            col_draw, col_result = st.columns([1.1, 1])
 
             with col_draw:
-                st.markdown("**Draw a digit (0–9) below:**")
+                st.markdown("**Dibuja un dígito (0–9):**")
                 canvas_result = st_canvas(
                     fill_color="rgba(0,0,0,0)",
-                    stroke_width=18,
+                    stroke_width=22,          # trazo más grueso = más píxeles al reducir
                     stroke_color="#FFFFFF",
                     background_color="#000000",
                     height=280,
@@ -605,76 +675,115 @@ with tabs[3]:
                 )
 
                 predict_model = st.selectbox(
-                    "Model to use for prediction",
+                    "Modelo para predicción",
                     list(st.session_state.trained.keys())
                 )
-                predict_btn = st.button("🔍 Predict Digit")
+                predict_btn = st.button("🔍 Predecir dígito")
 
             with col_result:
                 if predict_btn and canvas_result.image_data is not None:
-                    img_array = canvas_result.image_data
-                    # Convert to grayscale, resize to 8x8
-                    img_pil = Image.fromarray(img_array.astype("uint8")).convert("L")
-                    img_resized = img_pil.resize((8, 8), Image.LANCZOS)
-                    img_np = np.array(img_resized, dtype=float)
+                    img_flat, img_8x8 = preprocess_canvas_to_mnist(canvas_result.image_data)
 
-                    # Normalize to 0-16 range (MNIST sklearn)
-                    img_np = img_np / 255.0 * 16.0
-                    img_flat = img_np.flatten().reshape(1, -1)
+                    if img_flat is None:
+                        st.warning("⚠️ Canvas vacío — dibuja un dígito primero.")
+                    else:
+                        pipe = st.session_state.trained[predict_model]["pipe"]
+                        prediction = pipe.predict(img_flat)[0]
 
-                    pipe = st.session_state.trained[predict_model]["pipe"]
-                    prediction = pipe.predict(img_flat)[0]
+                        try:
+                            proba = pipe.predict_proba(img_flat)[0]
+                            conf = proba.max()
+                        except Exception:
+                            proba = None
+                            conf = None
 
-                    try:
-                        proba = pipe.predict_proba(img_flat)[0]
-                        conf = proba.max()
-                    except Exception:
-                        proba = None
-                        conf = None
+                        st.markdown(f"""
+                        <div class="result-box">
+                            <div class="result-digit">{prediction}</div>
+                            <div class="result-label">Dígito predicho</div>
+                            {'<div style="color:#5af7a2;font-family:Space Mono;margin-top:12px;font-size:1.1rem;">Confianza: ' + f'{conf:.1%}</div>' if conf else ''}
+                        </div>""", unsafe_allow_html=True)
 
-                    st.markdown(f"""
-                    <div class="result-box">
-                        <div class="result-digit">{prediction}</div>
-                        <div class="result-label">Predicted Digit</div>
-                        {'<div style="color:#5af7a2;font-family:Space Mono;margin-top:12px;">Confidence: ' + f'{conf:.1%}</div>' if conf else ''}
-                    </div>""", unsafe_allow_html=True)
+                        # ── Visualización del pipeline de preprocesamiento ──
+                        st.markdown("<br>**Pipeline de preprocesamiento:**", unsafe_allow_html=True)
 
-                    if proba is not None:
-                        st.markdown("<br>", unsafe_allow_html=True)
-                        fig_proba = px.bar(
-                            x=list(range(10)), y=proba,
-                            labels={"x": "Digit", "y": "Probability"},
-                            color=proba, color_continuous_scale="Purples",
-                            template=PLOTLY_TEMPLATE, title="Class Probabilities"
-                        )
-                        fig_proba.update_layout(
-                            font_family="Space Mono", height=280,
-                            coloraxis_showscale=False
-                        )
-                        st.plotly_chart(fig_proba, use_container_width=True)
+                        # Mostrar: original → 8x8 → valores numéricos
+                        fig_pipe, axes = plt.subplots(1, 3, figsize=(7, 2.5),
+                                                       facecolor="#0d0d0f")
+                        fig_pipe.patch.set_facecolor("#0d0d0f")
+
+                        # Original (canvas completo)
+                        orig_gray = Image.fromarray(
+                            canvas_result.image_data.astype("uint8"), mode="RGBA"
+                        ).convert("L")
+                        axes[0].imshow(np.array(orig_gray), cmap="gray", interpolation="nearest")
+                        axes[0].set_title("Canvas original", color="#888899",
+                                           fontsize=8, fontfamily="monospace")
+                        axes[0].axis("off")
+
+                        # 8×8 procesada
+                        axes[1].imshow(img_8x8, cmap="magma", interpolation="nearest",
+                                        vmin=0, vmax=16)
+                        axes[1].set_title("8×8 (input modelo)", color="#7c6af7",
+                                           fontsize=8, fontfamily="monospace")
+                        axes[1].axis("off")
+
+                        # Heatmap con valores numéricos (0–16)
+                        im = axes[2].imshow(img_8x8, cmap="magma", interpolation="nearest",
+                                             vmin=0, vmax=16)
+                        for row in range(8):
+                            for col in range(8):
+                                val = img_8x8[row, col]
+                                axes[2].text(col, row, f"{val:.0f}",
+                                              ha="center", va="center",
+                                              fontsize=5, color="white" if val > 6 else "#555")
+                        axes[2].set_title("Valores [0–16]", color="#f7a26a",
+                                           fontsize=8, fontfamily="monospace")
+                        axes[2].axis("off")
+
+                        plt.tight_layout(pad=0.5)
+                        st.pyplot(fig_pipe)
+                        plt.close()
+
+                        # Comparar con dígitos reales del dataset
+                        st.markdown("**Comparar con ejemplos del dataset:**",
+                                    unsafe_allow_html=True)
+                        sample_cols = st.columns(5)
+                        sample_idxs = np.where(y == prediction)[0][:5]
+                        for sc, si in zip(sample_cols, sample_idxs):
+                            fig_s, ax_s = plt.subplots(figsize=(1, 1), facecolor="#16161a")
+                            ax_s.imshow(digits.images[si], cmap="magma", vmin=0, vmax=16,
+                                         interpolation="nearest")
+                            ax_s.axis("off")
+                            sc.pyplot(fig_s, use_container_width=True)
+                            plt.close()
+
+                        if proba is not None:
+                            st.markdown("<br>", unsafe_allow_html=True)
+                            fig_proba = px.bar(
+                                x=list(range(10)), y=proba,
+                                labels={"x": "Dígito", "y": "Probabilidad"},
+                                color=proba, color_continuous_scale="Purples",
+                                template=PLOTLY_TEMPLATE, title="Probabilidades por clase"
+                            )
+                            fig_proba.update_layout(
+                                font_family="Space Mono", height=260,
+                                coloraxis_showscale=False
+                            )
+                            st.plotly_chart(fig_proba, use_container_width=True)
+
                 else:
                     st.markdown("""
                     <div style='background:#1e1e24;border:1px dashed #2a2a35;border-radius:12px;
                     padding:40px;text-align:center;color:#888899;'>
                         <div style='font-size:3rem;'>✏️</div>
                         <div style='margin-top:12px;font-family:Space Mono;font-size:0.8rem;'>
-                            Draw a digit and click Predict
+                            Dibuja un dígito y haz clic en Predecir
                         </div>
                     </div>""", unsafe_allow_html=True)
 
-                # Show the 8x8 preview
-                if canvas_result.image_data is not None and predict_btn:
-                    st.markdown("<br>**8×8 preview (model input):**", unsafe_allow_html=True)
-                    img_pil2 = Image.fromarray(canvas_result.image_data.astype("uint8")).convert("L")
-                    img_small = img_pil2.resize((8, 8), Image.LANCZOS)
-                    fig_prev, ax = plt.subplots(figsize=(2, 2), facecolor="#0d0d0f")
-                    ax.imshow(np.array(img_small), cmap="magma", interpolation="nearest")
-                    ax.axis("off")
-                    st.pyplot(fig_prev)
-                    plt.close()
-
         except ImportError:
-            st.error("Install `streamlit-drawable-canvas` to enable the drawing feature.")
+            st.error("Instala `streamlit-drawable-canvas` para activar esta función.")
             st.code("pip install streamlit-drawable-canvas")
 
 # ─── Footer ───────────────────────────────────────────────────────────────────
