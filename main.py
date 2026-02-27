@@ -217,6 +217,57 @@ def compute_metrics(y_true, y_pred, y_prob=None):
     return {"Accuracy": acc, "F1 (weighted)": f1, "Precision": prec, "Recall": rec, "ROC AUC": auc}
 
 
+def preprocess_canvas_to_mnist(image_data):
+    """
+    Convierte una imagen RGBA del canvas a un array 8x8 float
+    que coincide con la distribución del dataset sklearn digits (valores 0-16).
+    Retorna (img_flat_1d, img_8x8) o (None, None) si el canvas está vacío.
+    """
+    from PIL import ImageFilter
+
+    img_pil = Image.fromarray(image_data.astype("uint8"), mode="RGBA").convert("L")
+    img_np = np.array(img_pil)
+
+    if img_np.max() == 0:
+        return None, None
+
+    # Crop al bounding box del trazo
+    rows = np.any(img_np > 10, axis=1)
+    cols = np.any(img_np > 10, axis=0)
+    if not rows.any() or not cols.any():
+        return None, None
+
+    rmin, rmax = np.where(rows)[0][[0, -1]]
+    cmin, cmax = np.where(cols)[0][[0, -1]]
+    cropped = img_np[rmin:rmax+1, cmin:cmax+1]
+
+    # Padding proporcional para centrar como MNIST
+    h, w = cropped.shape
+    side = max(h, w)
+    pad = max(int(side * 0.25), 2)
+    square = np.zeros((side + 2 * pad, side + 2 * pad), dtype=np.uint8)
+    y_off = pad + (side - h) // 2
+    x_off = pad + (side - w) // 2
+    square[y_off:y_off+h, x_off:x_off+w] = cropped
+
+    # Suavizado antes del downscale agresivo
+    img_sq = Image.fromarray(square)
+    img_sq = img_sq.filter(ImageFilter.GaussianBlur(radius=1))
+
+    # Resize a 8x8
+    img_8 = img_sq.resize((8, 8), Image.LANCZOS)
+    img_8_np = np.array(img_8, dtype=float)
+
+    # Rescale lineal a [0, 16] igual que sklearn digits
+    mn, mx = img_8_np.min(), img_8_np.max()
+    if mx > mn:
+        img_8_np = (img_8_np - mn) / (mx - mn) * 16.0
+    else:
+        img_8_np = np.zeros_like(img_8_np)
+
+    return img_8_np.flatten().reshape(1, -1), img_8_np
+
+
 def plot_confusion_matrix(y_true, y_pred, title):
     cm = confusion_matrix(y_true, y_pred)
     fig = px.imshow(
@@ -580,68 +631,6 @@ with tabs[2]:
 # ════════════════════════════════════════════════════════════════════════════
 # TAB 4 – Draw & Predict
 # ════════════════════════════════════════════════════════════════════════════
-
-def preprocess_canvas_to_mnist(image_data: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert a canvas RGBA image (H×W×4) into an 8×8 float array matching
-    the sklearn digits dataset distribution (values 0–16).
-
-    Pipeline:
-      1. RGBA → Grayscale
-      2. Crop to bounding box of the drawn stroke (removes empty margins)
-      3. Add padding (20%) so the digit doesn't touch the edges — matches MNIST style
-      4. Resize to 8×8 with high-quality downsampling
-      5. Invert if needed so digit is bright on dark background
-      6. Rescale linearly to [0, 16] range
-    Returns (img_flat_1d, img_8x8) tuple.
-    """
-    from PIL import ImageOps, ImageFilter
-
-    img_pil = Image.fromarray(image_data.astype("uint8"), mode="RGBA").convert("L")
-    img_np = np.array(img_pil)
-
-    # ── 1. Check canvas has actual content ──────────────────────────────────
-    if img_np.max() == 0:
-        return None, None
-
-    # ── 2. Crop bounding box around the drawn stroke ─────────────────────────
-    # Find rows/cols that have any non-zero pixel
-    rows = np.any(img_np > 10, axis=1)
-    cols = np.any(img_np > 10, axis=0)
-    if not rows.any() or not cols.any():
-        return None, None
-
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    cropped = img_np[rmin:rmax+1, cmin:cmax+1]
-
-    # ── 3. Pad to square with 20% margin (mirrors MNIST centering) ───────────
-    h, w = cropped.shape
-    side = max(h, w)
-    pad = max(int(side * 0.25), 2)
-    square = np.zeros((side + 2 * pad, side + 2 * pad), dtype=np.uint8)
-    y_off = pad + (side - h) // 2
-    x_off = pad + (side - w) // 2
-    square[y_off:y_off+h, x_off:x_off+w] = cropped
-
-    # ── 4. Smooth slightly before aggressive downscale ───────────────────────
-    img_sq = Image.fromarray(square)
-    img_sq = img_sq.filter(ImageFilter.GaussianBlur(radius=1))
-
-    # ── 5. Resize to 8×8 ─────────────────────────────────────────────────────
-    img_8 = img_sq.resize((8, 8), Image.LANCZOS)
-    img_8_np = np.array(img_8, dtype=float)
-
-    # ── 6. Rescale to [0, 16] matching sklearn digits range ─────────────────
-    mn, mx = img_8_np.min(), img_8_np.max()
-    if mx > mn:
-        img_8_np = (img_8_np - mn) / (mx - mn) * 16.0
-    else:
-        img_8_np = np.zeros_like(img_8_np)
-
-    return img_8_np.flatten().reshape(1, -1), img_8_np
-
-
 with tabs[3]:
     st.markdown('<p class="section-header">Draw a Digit & Predict</p>', unsafe_allow_html=True)
 
